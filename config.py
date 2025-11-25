@@ -2,7 +2,7 @@
 # DATASET ROOTS
 # -----------------
 cifar_10_root = '/kaggle/input/cifar-10-python/cifar-10-batches-py'
-cifar_100_root = '/kaggle/input/cifar100/'
+cifar_100_root = '/kaggle/working/data/cifar100'
 tiny_imagenet_root = '/kaggle/input/tiny-imagenet-200/tiny-imagenet-200'
 cub_root = '/kaggle/input/cub-200-2011/CUB_200_2011'
 aircraft_root = '/kaggle/input/fgvc-aircraft-2013b/fgvc-aircraft-2013b'

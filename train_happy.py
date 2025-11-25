@@ -56,7 +56,7 @@ def train_offline(student, train_loader, test_loader, args):
     # [FINAL FIX] FORCE RESUME EPOCH 68
     # ==========================================
     start_epoch = 0
-    resume_file = '/kaggle/working/cifar100/Old50_Ratio0.8_20251125-162736/checkpoints/model_best.pt'
+    resume_file = '/kaggle/input/cifar-checkpoints/Old50_Ratio0.8_20251125-162736/checkpoints/model_best.pt'
     
     if os.path.exists(resume_file):
         print(f"\n[INFO] >>> TÌM THẤY FILE GỐC: {resume_file}")

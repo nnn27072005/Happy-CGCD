@@ -265,7 +265,7 @@ def get_cifar_100_datasets(train_transform, test_transform, config_dict, train_c
         [offline_train_dataset_samples[cls] for cls in range(len(list(train_classes)))])   # 32000   # NOTE!!!
 
     # Get test set for all classes
-    test_dataset = CustomCIFAR100(root=cifar_10_root, transform=test_transform, train=False)  # 10000
+    test_dataset = CustomCIFAR100(root=cifar_100_root, transform=test_transform, train=False, download=True)  # 10000
     # offline test dataset
     offline_test_dataset = subsample_classes(deepcopy(test_dataset), include_classes=list(train_classes))
 

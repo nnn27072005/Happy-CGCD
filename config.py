@@ -16,6 +16,6 @@ osr_split_dir = 'ssb_splits/'
 # -----------------
 # OTHER PATHS
 # -----------------
-dino_pretrain_path = 'dino_pretrain_path/dino_vitbase16_pretrain.pth'
+dino_pretrain_path = '/kaggle/input/dino-vitbase16-pretrain-pth/dino_vitbase16_pretrain.pth'
 feature_extract_dir = '/kaggle/working/extracted_features'     # Extract features to this directory
 exp_root_happy = '/kaggle/working/dev_outputs_Happy'          # All logs and checkpoints will be saved here

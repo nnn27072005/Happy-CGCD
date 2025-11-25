@@ -52,7 +52,35 @@ def train_offline(student, train_loader, test_loader, args):
     # best acc log
     best_test_acc_old = 0
 
-    for epoch in range(args.epochs_offline):
+    # ==========================================
+    # [FINAL FIX] FORCE RESUME EPOCH 68
+    # ==========================================
+    start_epoch = 0
+    resume_file = 'dev_outputs_Happy_offline/cifar100/Old50_Ratio0.8_20251125-162736/checkpoints/model_best.pt'
+    
+    if os.path.exists(resume_file):
+        print(f"\n[INFO] >>> TÌM THẤY FILE GỐC: {resume_file}")
+        try:
+            checkpoint = torch.load(resume_file, map_location='cpu')
+            student.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            start_epoch = checkpoint['epoch']
+            
+            if start_epoch > 0:
+                print(f"[INFO] >>> Dang tua Scheduler toi epoch {start_epoch}...")
+                for _ in range(start_epoch):
+                    exp_lr_scheduler.step()
+            
+            print(f"[SUCCESS] >>> RESUME THANH CONG! Chay tu Epoch {start_epoch}")
+        except Exception as e:
+            print(f"[ERROR] >>> Loi load file: {e}")
+            start_epoch = 0
+    else:
+        print(f"\n[CRITICAL] >>> KHONG TIM THAY FILE: {resume_file}")
+        print(">>> Vui long kiem tra lai lenh ls o buoc 1!")
+    # ==========================================
+
+    for epoch in range(start_epoch, args.epochs_offline):
         loss_record = AverageMeter()
 
         student.train()

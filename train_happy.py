@@ -230,6 +230,29 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
     best_test_acc_seen = 0
     best_test_acc_unseen = 0
 
+    start_epoch = 0
+    
+    resume_file_online = f'/kaggle/input/cifar100-online/checkpoints/model_session-{current_session}.pt'
+
+    if os.path.exists(resume_file_online):
+        print(f"\n[INFO-ONLINE] >>> Session {current_session}: TIM THAY CHECKPOINT: {resume_file_online}")
+        try:
+            checkpoint = torch.load(resume_file_online, map_location='cpu')
+            student.load_state_dict(checkpoint['model'])
+            optimizer.load_state_dict(checkpoint['optimizer'])
+            start_epoch = checkpoint['epoch']
+            
+            if start_epoch > 0:
+                print(f"[INFO-ONLINE] >>> Tua Scheduler toi epoch {start_epoch}...")
+                for _ in range(start_epoch):
+                    exp_lr_scheduler.step()
+            
+            print(f"[SUCCESS-ONLINE] >>> RESUME Session {current_session} THANH CONG! Tiep tuc tu Epoch {start_epoch}")
+        except Exception as e:
+            print(f"[ERROR-ONLINE] >>> Loi load file resume session {current_session}: {e}")
+            start_epoch = 0
+    else:
+        print(f"[INFO-ONLINE] >>> Khong tim thay checkpoint Session {current_session}. Bat dau train moi.")
     for epoch in range(args.epochs_online_per_session):
         loss_record = AverageMeter()
 
@@ -334,8 +357,8 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             'epoch': epoch + 1,
         }
 
-        #torch.save(save_dict, args.model_path[:-3] + '_session-' + str(current_session) + f'.pt')   # NOTE!!! session
-        #args.logger.info("model saved to {}.".format(args.model_path[:-3] + '_session-' + str(current_session) + f'.pt'))
+        torch.save(save_dict, args.model_path[:-3] + '_session-' + str(current_session) + f'.pt')   # NOTE!!! session
+        args.logger.info("model saved to {}.".format(args.model_path[:-3] + '_session-' + str(current_session) + f'.pt'))
 
         if all_acc_test > best_test_acc_all:
 
@@ -780,3 +803,4 @@ if __name__ == "__main__":
 
     else:
         raise NotImplementedError
+

@@ -5,35 +5,28 @@
 # ============================================================
 GPU_ID=0
 DATASET="cub"
-BATCH_SIZE=64            # CUB ảnh to, để 64 cho an toàn VRAM, nếu GPU khỏe >24GB thì lên 128
-NUM_OLD_CLASSES=100      # 100 lớp cũ
-PROP_TRAIN_LABELS=0.8    # Tỷ lệ label
-LR=0.01                  # LR thấp cho LeJEPA
-LAMBDA_LEJEPA=0.1        # Trọng số LeJEPA
+BATCH_SIZE=64           
+NUM_OLD_CLASSES=100      
+PROP_TRAIN_LABELS=0.8   
+LR=0.0001                 
+LAMBDA_LEJEPA=0.05
+SUP_WEIGHT=0.35    
 EPOCHS_OFFLINE=100
 EPOCHS_ONLINE=50
 SESSIONS=5
 SEED=0
 
-# --- CẤU HÌNH BỘ NHỚ ĐỆM (QUAN TRỌNG VỚI CUB) ---
-# CUB có ít ảnh (30 ảnh/class), nên chỉ giữ lại 5 ảnh làm mẫu
+# CUB settings
 ONLINE_OLD_SEEN_NUM=5     
 ONLINE_NOVEL_SEEN_NUM=5   
-ONLINE_NOVEL_UNSEEN_NUM=25 # Tổng số ảnh unlabel novel giữ lại (tùy chỉnh)
+ONLINE_NOVEL_UNSEEN_NUM=25 
 
-# Đường dẫn output gốc (phải khớp với exp_root_happy trong config.py của bạn)
-# Mặc định trong code thường là ./outputs hoặc dev_outputs_Happy
-EXP_ROOT_DIR="/kaggle/working/dev_outputs_Happy" 
+EXP_ROOT_DIR="dev_outputs_Happy" 
 
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
-echo "========================================================"
-echo "BẮT ĐẦU CHẠY HAPPY + LEJEPA TRÊN DATASET: $DATASET"
-echo "GPU: $GPU_ID | Batch: $BATCH_SIZE | LR: $LR"
-echo "========================================================"
-
 # ============================================================
-# GIAI ĐOẠN 1: OFFLINE TRAINING (Học 100 lớp cũ)
+# GIAI ĐOẠN 1: OFFLINE TRAINING
 # ============================================================
 echo ""
 echo "[GIAI ĐOẠN 1] Bắt đầu Training Offline..."
@@ -48,9 +41,14 @@ python train_happy.py \
     --num_old_classes $NUM_OLD_CLASSES \
     --prop_train_labels $PROP_TRAIN_LABELS \
     --lambda_lejepa $LAMBDA_LEJEPA \
+    --sup_weight $SUP_WEIGHT \
     --transform imagenet \
     --seed $SEED \
-    --exp_root $EXP_ROOT_DIR
+    --exp_root $EXP_ROOT_DIR \
+    --eval_funcs v2 \
+    --online_old_seen_num $ONLINE_OLD_SEEN_NUM \
+    --online_novel_seen_num $ONLINE_NOVEL_SEEN_NUM \
+    --online_novel_unseen_num $ONLINE_NOVEL_UNSEEN_NUM
 
 if [ $? -ne 0 ]; then
     echo "[LỖI] Training Offline thất bại. Dừng script."
@@ -60,29 +58,25 @@ fi
 echo "[HOÀN TẤT] Giai đoạn 1 thành công."
 
 # ============================================================
-# TỰ ĐỘNG TÌM ID CỦA OFFLINE MODEL VỪA CHẠY
+# TỰ ĐỘNG TÌM ID
 # ============================================================
-# Đường dẫn nơi lưu log offline (Happy thường lưu dạng: exp_root_offline/dataset/ID)
 OFFLINE_LOG_PATH="${EXP_ROOT_DIR}_offline/${DATASET}"
-
-# Tìm thư mục mới nhất được tạo ra trong đường dẫn đó
 LATEST_OFFLINE_ID=$(ls -t "$OFFLINE_LOG_PATH" | head -n 1)
 
 if [ -z "$LATEST_OFFLINE_ID" ]; then
-    echo "[LỖI] Không tìm thấy thư mục checkpoint offline nào trong $OFFLINE_LOG_PATH"
+    echo "[LỖI] Không tìm thấy thư mục checkpoint offline."
     exit 1
 fi
 
 echo ""
 echo ">>> Đã tìm thấy Offline ID mới nhất: $LATEST_OFFLINE_ID"
-echo ">>> Chuẩn bị chuyển sang giai đoạn Online..."
 sleep 3
 
 # ============================================================
-# GIAI ĐOẠN 2: ONLINE CONTINUAL LEARNING (5 Sessions)
+# GIAI ĐOẠN 2: ONLINE CONTINUAL LEARNING
 # ============================================================
 echo ""
-echo "[GIAI ĐOẠN 2] Bắt đầu Training Online (Continual)..."
+echo "[GIAI ĐOẠN 2] Bắt đầu Training Online..."
 
 python train_happy.py \
     --dataset_name $DATASET \
@@ -93,12 +87,17 @@ python train_happy.py \
     --num_old_classes $NUM_OLD_CLASSES \
     --continual_session_num $SESSIONS \
     --lambda_lejepa $LAMBDA_LEJEPA \
+    --sup_weight $SUP_WEIGHT \
     --init_new_head \
     --prop_train_labels $PROP_TRAIN_LABELS \
     --load_offline_id "$LATEST_OFFLINE_ID" \
     --transform imagenet \
     --seed $SEED \
-    --exp_root $EXP_ROOT_DIR
+    --exp_root $EXP_ROOT_DIR \
+    --eval_funcs v2 \
+    --online_old_seen_num $ONLINE_OLD_SEEN_NUM \
+    --online_novel_seen_num $ONLINE_NOVEL_SEEN_NUM \
+    --online_novel_unseen_num $ONLINE_NOVEL_UNSEEN_NUM
 
 if [ $? -ne 0 ]; then
     echo "[LỖI] Training Online thất bại."
@@ -106,6 +105,4 @@ if [ $? -ne 0 ]; then
 fi
 
 echo ""
-echo "========================================================"
 echo "CHÚC MỪNG! TOÀN BỘ QUÁ TRÌNH HUẤN LUYỆN ĐÃ HOÀN TẤT."
-echo "========================================================"

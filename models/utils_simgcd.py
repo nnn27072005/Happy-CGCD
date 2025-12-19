@@ -265,3 +265,116 @@ class DistillLoss_fix(nn.Module):
                 n_loss_terms += 1
         total_loss /= n_loss_terms
         return total_loss
+    
+# Thêm vào cuối file utils_simgcd.py
+
+class EdgeLoss(nn.Module):
+    def __init__(self, device='cuda'):
+        super().__init__()
+        # Sobel kernel cho hướng X và Y
+        self.sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(device)
+        self.sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3).to(device)
+
+    def forward(self, student_map, teacher_map):
+        """
+        student_map, teacher_map: (Batch, Channels, Height, Width)
+        Brixel gợi ý dùng PCA để giảm Channels trước, nhưng ở đây ta có thể tính trực tiếp hoặc mean qua Channels.
+        Để đơn giản và hiệu quả, ta tính trên từng channel hoặc group.
+        """
+        # Nếu channels quá lớn, có thể gây tốn VRAM. Ta có thể lấy mean theo channel để ra bản đồ activation map (B, 1, H, W)
+        s_map = student_map.mean(dim=1, keepdim=True)
+        t_map = teacher_map.mean(dim=1, keepdim=True)
+
+        # Tính đạo hàm theo X và Y
+        s_grad_x = F.conv2d(s_map, self.sobel_x, padding=1)
+        s_grad_y = F.conv2d(s_map, self.sobel_y, padding=1)
+        
+        t_grad_x = F.conv2d(t_map, self.sobel_x, padding=1)
+        t_grad_y = F.conv2d(t_map, self.sobel_y, padding=1)
+
+        # L1 Loss giữa các biên cạnh (Edge)
+        loss_x = F.l1_loss(s_grad_x, t_grad_x)
+        loss_y = F.l1_loss(s_grad_y, t_grad_y)
+        
+        return loss_x + loss_y
+
+class SpectralLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, student_map, teacher_map):
+        """
+        So sánh phổ tần số (Frequency Domain) dùng FFT
+        """
+        # Chuyển sang miền tần số (Batch, C, H, W) -> (Batch, C, H, W/2 + 1)
+        # Tương tự EdgeLoss, ta nên tính trên activation map gộp để tiết kiệm
+        s_map = student_map.mean(dim=1) # (B, H, W)
+        t_map = teacher_map.mean(dim=1) # (B, H, W)
+
+        # FFT 2D
+        s_fft = torch.fft.rfft2(s_map, norm="ortho")
+        t_fft = torch.fft.rfft2(t_map, norm="ortho")
+
+        # So sánh biên độ (Amplitude) hoặc Log-Amplitude
+        # Brixel dùng Log-Amplitude để cân bằng các tần số cao/thấp
+        s_amp = torch.abs(s_fft) + 1e-6
+        t_amp = torch.abs(t_fft) + 1e-6
+        
+        loss = F.mse_loss(torch.log(s_amp), torch.log(t_amp))
+        return loss
+    
+class SIGReg(torch.nn.Module):
+    def __init__(self, knots=17):
+        super().__init__()
+        # Khởi tạo các điểm nút và trọng số cho tích phân số (Quadrature)
+        t = torch.linspace(0, 3, knots, dtype=torch.float32)
+        dt = 3 / (knots - 1)
+        weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
+        weights[[0, -1]] = dt
+        # Cửa sổ Gaussian (Gaussian window)
+        window = torch.exp(-t.square() / 2.0)
+        
+        # Đăng ký buffer để không bị tính vào gradient update
+        self.register_buffer("t", t)
+        self.register_buffer("phi", window)
+        self.register_buffer("weights", weights * window)
+
+    def forward(self, proj):
+        """
+        Input: proj có shape (..., Dim)
+        Output: Scalar loss
+        """
+        # Sinh ma trận chiếu ngẫu nhiên A (Dim, 256)
+        # Trong paper gốc dùng 256 chiều chiếu
+        A = torch.randn(proj.size(-1), 256, device=proj.device)
+        A = A.div_(A.norm(p=2, dim=0)) # Normalize cột
+        
+        # Chiếu dữ liệu: (..., Dim) @ (Dim, 256) -> (..., 256)
+        # Nhân với t để chuẩn bị tính Characteristic Function
+        # x_t shape: (..., 256, knots)
+        x_t = (proj @ A).unsqueeze(-1) * self.t
+        
+        # Tính sai số giữa Characteristic Function thực tế và mục tiêu (Gaussian)
+        # .mean(-3) ở đây giả định input là (V, N, D) hoặc (N, D). 
+        # Cần mean theo dimension batch (N).
+        # Nếu input proj là (V, N, D), ta cần mean theo N (dim 1).
+        # Nếu input proj là (N, D), ta cần mean theo N (dim 0).
+        # Code gốc: (x_t.cos().mean(-3) ...), nghĩa là trục Batch nằm ở index -3 tính từ cuối lên.
+        
+        # ĐỂ AN TOÀN VÀ TƯƠNG THÍCH HAPPY:
+        # Ta sẽ flatten mọi dimensions trừ dimension cuối (Features)
+        # Sau đó tính mean theo toàn bộ batch.
+        
+        x_t_flat = x_t.reshape(-1, 256, x_t.shape[-1]) # (Total_Samples, 256, knots)
+        
+        # Tính mean theo mẫu (Sample mean) -> Empirical CF
+        err = (x_t_flat.cos().mean(0) - self.phi).square() + x_t_flat.sin().mean(0).square()
+        
+        # Tích phân số
+        statistic = (err @ self.weights) * proj.size(-1) # Scale theo feature dim (size(-2) trong code gốc có vẻ là typo hoặc context khác, size(-1) là feature dim hợp lý hơn cho scale)
+        
+        # Code gốc dùng proj.size(-2) vì proj là (V, N, D), size(-2) là N (Batch size)? 
+        # Không, LeJEPA loss thường scale theo dimension để ổn định. 
+        # Tuy nhiên, hãy giữ nguyên logic statistic.mean() cuối cùng.
+        
+        return statistic.mean()

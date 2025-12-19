@@ -12,13 +12,14 @@ import torch
 import torch.nn as nn
 from torch.optim import SGD, lr_scheduler
 
+# Giả định các thư viện này đã có sẵn trong môi trường của bạn
 from project_utils.general_utils import set_seed, init_experiment, AverageMeter
 from project_utils.cluster_and_log_utils import log_accs_from_preds
 
 from data.augmentations import get_transform
 from data.get_datasets import get_class_splits, ContrastiveLearningViewGenerator, get_datasets
 
-from models.utils_simgcd import DINOHead, get_params_groups, SupConLoss, info_nce_logits, DistillLoss
+from models.utils_simgcd import DINOHead, get_params_groups, SupConLoss, info_nce_logits, DistillLoss, EdgeLoss, SpectralLoss, SIGReg
 from models.utils_simgcd_pro import get_kmeans_centroid_for_new_head
 from models.utils_proto_aug import ProtoAugManager
 from models import vision_transformer as vits
@@ -32,7 +33,6 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 '''offline train and test'''
 '''====================================================================================================================='''
 def train_offline(student, train_loader, test_loader, args):
-
     params_groups = get_params_groups(student)
     optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
 
@@ -49,17 +49,28 @@ def train_offline(student, train_loader, test_loader, args):
                         args.warmup_teacher_temp,
                         args.teacher_temp,
                     )
+    
+    # --- [NEW] Khởi tạo SIGReg cho LeJEPA ---
+    sigreg_criterion = SIGReg(knots=17).cuda()
+    # Lấy lambda từ args hoặc default an toàn (0.1)
+    lambda_lejepa = getattr(args, 'lambda_lejepa', 0.1) 
+
     # best acc log
     best_test_acc_old = 0
 
     # ==========================================
-    # [FINAL FIX] FORCE RESUME EPOCH 68
+    # [OFFLINE] RESUME LOGIC (Giữ nguyên của bạn)
     # ==========================================
     start_epoch = 0
-    resume_file = 'dev_outputs_Happy_offline/cifar100/Old50_Ratio0.8_20251125-162736/checkpoints/model_best.pt'
+    resume_file = '/kaggle/input/cifar-checkpoints/Old50_Ratio0.8_20251125-162736/checkpoints/model_best.pt'
     
+    if not os.path.exists(resume_file):
+        resume_file = args.model_path 
+        if not os.path.exists(resume_file):
+             resume_file = args.model_path[:-3] + '_best.pt'
+
     if os.path.exists(resume_file):
-        print(f"\n[INFO] >>> TÌM THẤY FILE GỐC: {resume_file}")
+        print(f"\n[INFO-OFFLINE] >>> TIM THAY FILE: {resume_file}")
         try:
             checkpoint = torch.load(resume_file, map_location='cpu')
             student.load_state_dict(checkpoint['model'])
@@ -71,13 +82,12 @@ def train_offline(student, train_loader, test_loader, args):
                 for _ in range(start_epoch):
                     exp_lr_scheduler.step()
             
-            print(f"[SUCCESS] >>> RESUME THANH CONG! Chay tu Epoch {start_epoch}")
+            print(f"[SUCCESS] >>> RESUME OFFLINE THANH CONG! Chay tu Epoch {start_epoch}")
         except Exception as e:
             print(f"[ERROR] >>> Loi load file: {e}")
             start_epoch = 0
     else:
-        print(f"\n[CRITICAL] >>> KHONG TIM THAY FILE: {resume_file}")
-        print(">>> Vui long kiem tra lai lenh ls o buoc 1!")
+        print(f"\n[INFO] >>> Khong tim thay checkpoint offline, train tu dau.")
     # ==========================================
 
     for epoch in range(start_epoch, args.epochs_offline):
@@ -92,41 +102,65 @@ def train_offline(student, train_loader, test_loader, args):
             class_labels, mask_lab = class_labels.cuda(non_blocking=True), mask_lab.cuda(non_blocking=True).bool()
             images = torch.cat(images, dim=0).cuda(non_blocking=True)
 
+            # Forward pass
             student_proj, student_out = student(images)
             teacher_out = student_out.detach()
 
-            # clustering, sup
+            # ------------------------------------------------------------------
+            # 1. Supervised & Clustering Loss (Giữ nguyên logic của Happy/SimGCD)
+            # ------------------------------------------------------------------
+            # Supervised Classification (CrossEntropy)
             sup_logits = torch.cat([f[mask_lab] for f in (student_out / 0.1).chunk(2)], dim=0)
             sup_labels = torch.cat([class_labels[mask_lab] for _ in range(2)], dim=0)
             cls_loss = nn.CrossEntropyLoss()(sup_logits, sup_labels)
 
-            # clustering, unsup
+            # Clustering Regularization
             cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
             avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
             me_max_loss = - torch.sum(torch.log(avg_probs**(-avg_probs))) + math.log(float(len(avg_probs)))
             cluster_loss += args.memax_weight * me_max_loss
 
-            # represent learning, unsup
-            contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
-            contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
+            # ------------------------------------------------------------------
+            # 2. LeJEPA Loss (THAY THẾ InfoNCE & SupCon)
+            # ------------------------------------------------------------------
+            # Logic: Thay vì đẩy các sample xa nhau bằng InfoNCE (cần batch lớn/negative pairs),
+            # ta dùng SIGReg để ép phân phối features thành Gaussian và Invariance để kéo view lại gần nhau.
+            
+            # Reshape features: (2*Batch, Dim) -> (2, Batch, Dim)
+            n_views = 2 
+            batch_size = class_labels.shape[0] 
+            # student_proj shape: [256, 768] (với batch 128, views 2)
+            proj_views = student_proj.view(n_views, batch_size, -1)
 
-            # representation learning, sup
-            student_proj = torch.cat([f[mask_lab].unsqueeze(1) for f in student_proj.chunk(2)], dim=1)
-            student_proj = torch.nn.functional.normalize(student_proj, dim=-1)
-            sup_con_labels = class_labels[mask_lab]
-            sup_con_loss = SupConLoss()(student_proj, labels=sup_con_labels)
+            # A. Invariance Loss: (Mean_View - Current_View)^2
+            # Kéo các view của cùng 1 ảnh về trung tâm của chúng (Thay thế Positive Pair)
+            loss_inv = (proj_views.mean(0) - proj_views).square().mean()
 
+            # B. SIGReg Loss:
+            # Ép phân phối đặc trưng thành Gaussian đẳng hướng (Thay thế Negative Pair/Uniformity)
+            loss_sigreg = sigreg_criterion(student_proj)
+
+            # Tổng hợp LeJEPA
+            loss_lejepa = lambda_lejepa * loss_sigreg + (1 - lambda_lejepa) * loss_inv
+
+            # ------------------------------------------------------------------
             # Total loss
+            # ------------------------------------------------------------------
             loss = 0
+            # Phần Supervised + Clustering (Để đảm bảo phân lớp chính xác)
             loss += (1 - args.sup_weight) * cluster_loss + args.sup_weight * cls_loss
-            loss += (1 - args.sup_weight) * contrastive_loss + args.sup_weight * sup_con_loss
+            
+            # Phần Representation Learning (Dùng LeJEPA thay cho Contrastive)
+            # Ta coi LeJEPA là một dạng Unsupervised Regularization mạnh
+            # Trọng số (1 - args.sup_weight) áp dụng cho phần Unsupervised nói chung
+            loss += (1 - args.sup_weight) * loss_lejepa
 
             # logs
             pstr = ''
             pstr += f'cls_loss: {cls_loss.item():.4f} '
             pstr += f'cluster_loss: {cluster_loss.item():.4f} '
-            pstr += f'sup_con_loss: {sup_con_loss.item():.4f} '
-            pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
+            pstr += f'lejepa_loss: {loss_lejepa.item():.4f} '
+            pstr += f'(sigreg: {loss_sigreg.item():.4f}, inv: {loss_inv.item():.4f})'
 
             loss_record.update(loss.item(), class_labels.size(0))
             optimizer.zero_grad()
@@ -206,7 +240,7 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
 
     params_groups = get_params_groups(student)
     optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
+    sigreg_criterion = SIGReg(knots=17).to(device)
     exp_lr_scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=args.epochs_online_per_session,
@@ -220,7 +254,8 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
                         args.warmup_teacher_temp,
                         args.teacher_temp,
                     )
-
+    edge_criterion = EdgeLoss(device='cuda') # Hoặc device tương ứng
+    spectral_criterion = SpectralLoss()
     # best acc log
     best_test_acc_all = 0
     best_test_acc_old = 0
@@ -232,7 +267,7 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
 
     for epoch in range(args.epochs_online_per_session):
         loss_record = AverageMeter()
-
+        lambda_lejepa = getattr(args, 'lambda_lejepa', 0.5)
         student.train()
         student_pre.eval()
         for batch_idx, batch in enumerate(train_loader):
@@ -245,7 +280,8 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
 
             student_proj, student_out = student(images)
             teacher_out = student_out.detach()
-
+            n_views = 2
+            batch_size = class_labels.shape[0]
             # clustering, unsup
             cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
             avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
@@ -279,13 +315,34 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
 
             proto_aug_loss = proto_aug_manager.compute_proto_aug_hardness_aware_loss(student)
-            feats = student[0](images)
-            feats = torch.nn.functional.normalize(feats, dim=-1)
+            # not apply distill loss
+            # feats = student[0](images)
+            # feats = torch.nn.functional.normalize(feats, dim=-1)
+            # with torch.no_grad():
+            #     feats_pre = student_pre[0](images)
+            #     feats_pre = torch.nn.functional.normalize(feats_pre, dim=-1)
+            # feat_distill_loss = (feats-feats_pre).pow(2).sum() / len(feats)
+            
+            # apply Brixel loss
+            student_tokens_list = student[0].get_intermediate_layers(images, n=1)
+            student_tokens = student_tokens_list[0] 
+            student_tokens = torch.nn.functional.normalize(student_tokens, dim=-1)
             with torch.no_grad():
-                feats_pre = student_pre[0](images)
-                feats_pre = torch.nn.functional.normalize(feats_pre, dim=-1)
-            feat_distill_loss = (feats-feats_pre).pow(2).sum() / len(feats)
+                teacher_tokens_list = student_pre[0].get_intermediate_layers(images, n=1)
+                teacher_tokens = teacher_tokens_list[0]
+                teacher_tokens = torch.nn.functional.normalize(teacher_tokens, dim=-1)
 
+            # 2. Tính toán Loss BRIXEL
+            loss_edge = edge_criterion(student_tokens, teacher_tokens)
+            loss_spec = spectral_criterion(student_tokens, teacher_tokens)
+
+            # 3. Tính MSE cho CLS token (để giữ ngữ nghĩa global)
+            # Token 0 là CLS
+            loss_cls = (student_tokens[:, 0] - teacher_tokens[:, 0]).pow(2).sum() / len(images)
+
+            # 4. Tổng hợp feat_distill_loss
+            # Kết hợp CLS token (cũ) + Spatial Structure (Brixel)
+            feat_distill_loss = loss_cls +  loss_edge +  loss_spec
             # Total loss
             loss = 0
             loss += 1 * cluster_loss
@@ -334,8 +391,9 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             'epoch': epoch + 1,
         }
 
-        #torch.save(save_dict, args.model_path[:-3] + '_session-' + str(current_session) + f'.pt')   # NOTE!!! session
-        #args.logger.info("model saved to {}.".format(args.model_path[:-3] + '_session-' + str(current_session) + f'.pt'))
+        # [QUAN TRONG] Luu checkpoint thuong xuyen de resume duoc neu crash
+        torch.save(save_dict, args.model_path[:-3] + '_session-' + str(current_session) + f'.pt')   
+        args.logger.info("model saved to {}.".format(args.model_path[:-3] + '_session-' + str(current_session) + f'.pt'))
 
         if all_acc_test > best_test_acc_all:
 
@@ -416,14 +474,14 @@ if __name__ == "__main__":
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
 
     parser.add_argument('--grad_from_block', type=int, default=11)
-    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--lr', type=float, default=0.01)
     parser.add_argument('--gamma', type=float, default=0.1)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--weight_decay', type=float, default=5e-5)
     parser.add_argument('--exp_root', type=str, default=exp_root_happy)
     parser.add_argument('--transform', type=str, default='imagenet')
 
-    parser.add_argument('--temperature', type=float, default=1.0)
+    # parser.add_argument('--temperature', type=float, default=1.0)
     parser.add_argument('--sup_weight', type=float, default=0.35)
     parser.add_argument('--n_views', default=2, type=int)
     parser.add_argument('--contrast_unlabel_only', action='store_true', default=False)
@@ -437,7 +495,6 @@ if __name__ == "__main__":
     parser.add_argument('--memax_new_in_weight', type=float, default=1)
     parser.add_argument('--warmup_teacher_temp', default=0.07, type=float, help='Initial value for the teacher temperature.')
     parser.add_argument('--teacher_temp', default=0.04, type=float, help='Final value (after linear warmup) of the teacher temperature.')
-    #parser.add_argument('--teacher_temp_final', default=0.05, type=float, help='Final value (online session) of the teacher temperature.')
     parser.add_argument('--warmup_teacher_temp_epochs', default=30, type=int, help='Number of warmup epochs for the teacher temperature.')
 
     '''clustering-guided initialization'''
@@ -446,8 +503,10 @@ if __name__ == "__main__":
     '''PASS params'''
     parser.add_argument('--proto_aug_weight', type=float, default=1.0)
     parser.add_argument('--feat_distill_weight', type=float, default=1.0)
-    parser.add_argument('--radius_scale', type=float, default=1.0)
-
+    # parser.add_argument('--radius_scale', type=float, default=1.0)
+    # --- Arguments LeJEPA ---
+    parser.add_argument('--lambda_lejepa', type=float, default=0.1, help='Balance between SIGReg and Invariance')
+    parser.add_argument('--sigreg_gamma', type=float, default=1.0, help='Gamma for SIGReg covariance')
     '''hardness-aware sampling temperature'''
     parser.add_argument('--hardness_temp', type=float, default=0.1)
 

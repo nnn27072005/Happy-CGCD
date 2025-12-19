@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
 from torch.optim import SGD, lr_scheduler, AdamW
-
+import torch.nn.functional as F
 # Giả định các thư viện này đã có sẵn trong môi trường của bạn
 from project_utils.general_utils import set_seed, init_experiment, AverageMeter
 from project_utils.cluster_and_log_utils import log_accs_from_preds
@@ -106,7 +106,7 @@ def train_offline(student, train_loader, test_loader, args):
             # Forward pass
             student_proj, student_out = student(images)
             teacher_out = student_out.detach()
-
+            student_proj_norm = F.layer_norm(student_proj, (student_proj.shape[-1],))
             # ------------------------------------------------------------------
             # 1. Supervised & Clustering Loss (Giữ nguyên logic của Happy/SimGCD)
             # ------------------------------------------------------------------
@@ -139,7 +139,7 @@ def train_offline(student, train_loader, test_loader, args):
 
             # B. SIGReg Loss:
             # Ép phân phối đặc trưng thành Gaussian đẳng hướng (Thay thế Negative Pair/Uniformity)
-            loss_sigreg = sigreg_criterion(student_proj)
+            loss_sigreg = sigreg_criterion(student_proj_norm)
 
             # Tổng hợp LeJEPA
             loss_lejepa = lambda_lejepa * loss_sigreg + (1 - lambda_lejepa) * loss_inv
@@ -279,6 +279,8 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
 
             student_proj, student_out = student(images)
             teacher_out = student_out.detach()
+
+            student_proj_norm = F.layer_norm(student_proj, (student_proj.shape[-1],))
             n_views = 2
             batch_size = class_labels.shape[0]
             proj_views = student_proj.view(n_views, batch_size, -1)
@@ -288,7 +290,7 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
 
             # B. SIGReg Loss:
             # Ép phân phối đặc trưng thành Gaussian đẳng hướng (Thay thế Negative Pair/Uniformity)
-            loss_sigreg = sigreg_criterion(student_proj)
+            loss_sigreg = sigreg_criterion(student_proj_norm)
 
             # Tổng hợp LeJEPA
             loss_lejepa = lambda_lejepa * loss_sigreg + (1 - lambda_lejepa) * loss_inv

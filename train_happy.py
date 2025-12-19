@@ -468,7 +468,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--num_workers_test', default=4, type=int)
-    parser.add_argument('--eval_funcs', nargs='+', help='Which eval functions to use', default='v2')
+    parser.add_argument('--eval_funcs', nargs='+', help='Which eval functions to use', default=['v2'])
 
     parser.add_argument('--dataset_name', type=str, default='cifar100', help='options: cifar10, cifar100, tiny_imagenet, cub, imagenet_100')
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)

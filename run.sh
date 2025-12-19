@@ -15,6 +15,12 @@ EPOCHS_ONLINE=50
 SESSIONS=5
 SEED=0
 
+# --- CẤU HÌNH BỘ NHỚ ĐỆM (QUAN TRỌNG VỚI CUB) ---
+# CUB có ít ảnh (30 ảnh/class), nên chỉ giữ lại 5 ảnh làm mẫu
+ONLINE_OLD_SEEN_NUM=5     
+ONLINE_NOVEL_SEEN_NUM=5   
+ONLINE_NOVEL_UNSEEN_NUM=25 # Tổng số ảnh unlabel novel giữ lại (tùy chỉnh)
+
 # Đường dẫn output gốc (phải khớp với exp_root_happy trong config.py của bạn)
 # Mặc định trong code thường là ./outputs hoặc dev_outputs_Happy
 EXP_ROOT_DIR="/kaggle/working/dev_outputs_Happy" 

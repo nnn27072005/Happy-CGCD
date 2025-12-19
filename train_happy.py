@@ -10,7 +10,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 import torch
 import torch.nn as nn
-from torch.optim import SGD, lr_scheduler
+from torch.optim import SGD, lr_scheduler, AdamW
 
 # Giả định các thư viện này đã có sẵn trong môi trường của bạn
 from project_utils.general_utils import set_seed, init_experiment, AverageMeter
@@ -34,12 +34,13 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 '''====================================================================================================================='''
 def train_offline(student, train_loader, test_loader, args):
     params_groups = get_params_groups(student)
-    optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
-
+    optimizer = AdamW(params_groups, lr=1e-4, weight_decay=1e-2) 
+    
+    # Cập nhật scheduler tương ứng
     exp_lr_scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=args.epochs_offline,
-            eta_min=args.lr * 1e-3,
+            eta_min=1e-6,
         )
 
     cluster_criterion = DistillLoss(
@@ -239,7 +240,7 @@ def test_offline(model, test_loader, epoch, save_name, args):
 def train_online(student, student_pre, proto_aug_manager, train_loader, test_loader, current_session, args):
 
     params_groups = get_params_groups(student)
-    optimizer = SGD(params_groups, lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    optimizer = AdamW(params_groups, lr=args.lr, weight_decay=args.weight_decay)
     sigreg_criterion = SIGReg(knots=17).to(device)
     exp_lr_scheduler = lr_scheduler.CosineAnnealingLR(
             optimizer,
@@ -254,8 +255,6 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
                         args.warmup_teacher_temp,
                         args.teacher_temp,
                     )
-    edge_criterion = EdgeLoss(device='cuda') # Hoặc device tương ứng
-    spectral_criterion = SpectralLoss()
     # best acc log
     best_test_acc_all = 0
     best_test_acc_old = 0
@@ -267,7 +266,7 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
 
     for epoch in range(args.epochs_online_per_session):
         loss_record = AverageMeter()
-        lambda_lejepa = getattr(args, 'lambda_lejepa', 0.5)
+        lambda_lejepa = getattr(args, 'lambda_lejepa', 0.05)
         student.train()
         student_pre.eval()
         for batch_idx, batch in enumerate(train_loader):
@@ -282,6 +281,18 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             teacher_out = student_out.detach()
             n_views = 2
             batch_size = class_labels.shape[0]
+            proj_views = student_proj.view(n_views, batch_size, -1)
+            # A. Invariance Loss: (Mean_View - Current_View)^2
+            # Kéo các view của cùng 1 ảnh về trung tâm của chúng (Thay thế Positive Pair)
+            loss_inv = (proj_views.mean(0) - proj_views).square().mean()
+
+            # B. SIGReg Loss:
+            # Ép phân phối đặc trưng thành Gaussian đẳng hướng (Thay thế Negative Pair/Uniformity)
+            loss_sigreg = sigreg_criterion(student_proj)
+
+            # Tổng hợp LeJEPA
+            loss_lejepa = lambda_lejepa * loss_sigreg + (1 - lambda_lejepa) * loss_inv
+
             # clustering, unsup
             cluster_loss = cluster_criterion(student_out, teacher_out, epoch)
             avg_probs = (student_out / 0.1).softmax(dim=1).mean(dim=0)
@@ -309,44 +320,19 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             cluster_loss += args.memax_old_new_weight * me_max_loss_old_new + \
                 args.memax_old_in_weight * me_max_loss_old_in + args.memax_new_in_weight * me_max_loss_new_in
 
-
-            # represent learning, unsup
-            contrastive_logits, contrastive_labels = info_nce_logits(features=student_proj)
-            contrastive_loss = torch.nn.CrossEntropyLoss()(contrastive_logits, contrastive_labels)
-
             proto_aug_loss = proto_aug_manager.compute_proto_aug_hardness_aware_loss(student)
-            # not apply distill loss
-            # feats = student[0](images)
-            # feats = torch.nn.functional.normalize(feats, dim=-1)
-            # with torch.no_grad():
-            #     feats_pre = student_pre[0](images)
-            #     feats_pre = torch.nn.functional.normalize(feats_pre, dim=-1)
-            # feat_distill_loss = (feats-feats_pre).pow(2).sum() / len(feats)
-            
-            # apply Brixel loss
-            student_tokens_list = student[0].get_intermediate_layers(images, n=1)
-            student_tokens = student_tokens_list[0] 
-            student_tokens = torch.nn.functional.normalize(student_tokens, dim=-1)
-            with torch.no_grad():
-                teacher_tokens_list = student_pre[0].get_intermediate_layers(images, n=1)
-                teacher_tokens = teacher_tokens_list[0]
-                teacher_tokens = torch.nn.functional.normalize(teacher_tokens, dim=-1)
-
-            # 2. Tính toán Loss BRIXEL
-            loss_edge = edge_criterion(student_tokens, teacher_tokens)
-            loss_spec = spectral_criterion(student_tokens, teacher_tokens)
-
-            # 3. Tính MSE cho CLS token (để giữ ngữ nghĩa global)
-            # Token 0 là CLS
-            loss_cls = (student_tokens[:, 0] - teacher_tokens[:, 0]).pow(2).sum() / len(images)
 
             # 4. Tổng hợp feat_distill_loss
-            # Kết hợp CLS token (cũ) + Spatial Structure (Brixel)
-            feat_distill_loss = loss_cls +  loss_edge +  loss_spec
+            feats = student[0](images)
+            feats = torch.nn.functional.normalize(feats, dim=-1)
+            with torch.no_grad():
+                feats_pre = student_pre[0](images)
+                feats_pre = torch.nn.functional.normalize(feats_pre, dim=-1)
+            feat_distill_loss = (feats-feats_pre).pow(2).sum() / len(feats)
             # Total loss
             loss = 0
             loss += 1 * cluster_loss
-            loss += 1 * contrastive_loss
+            loss += 1 * loss_lejepa
             loss += args.proto_aug_weight * proto_aug_loss
             loss += args.feat_distill_weight * feat_distill_loss
 
@@ -356,7 +342,7 @@ def train_online(student, student_pre, proto_aug_manager, train_loader, test_loa
             pstr += f'me_max_loss_old_in: {me_max_loss_old_in.item():.4f} '
             pstr += f'me_max_loss_new_in: {me_max_loss_new_in.item():.4f} '
             pstr += f'cluster_loss: {cluster_loss.item():.4f} '
-            pstr += f'contrastive_loss: {contrastive_loss.item():.4f} '
+            pstr += f'loss_lejepa: {loss_lejepa.item():.4f} '
             pstr += f'proto_aug_loss: {proto_aug_loss.item():.4f} '
             pstr += f'feat_distill_loss: {feat_distill_loss.item():.4f} '
 
@@ -468,7 +454,7 @@ if __name__ == "__main__":
     parser.add_argument('--batch_size', default=128, type=int)
     parser.add_argument('--num_workers', default=4, type=int)
     parser.add_argument('--num_workers_test', default=4, type=int)
-    parser.add_argument('--eval_funcs', nargs='+', help='Which eval functions to use', default=['v2'])
+    parser.add_argument('--eval_funcs', nargs='+', help='Which eval functions to use', default='v2')
 
     parser.add_argument('--dataset_name', type=str, default='cifar100', help='options: cifar10, cifar100, tiny_imagenet, cub, imagenet_100')
     parser.add_argument('--use_ssb_splits', action='store_true', default=True)
@@ -482,10 +468,9 @@ if __name__ == "__main__":
     parser.add_argument('--transform', type=str, default='imagenet')
 
     # parser.add_argument('--temperature', type=float, default=1.0)
-    parser.add_argument('--sup_weight', type=float, default=0.35)
+    parser.add_argument('--sup_weight', type=float, default=0.6)
     parser.add_argument('--n_views', default=2, type=int)
     parser.add_argument('--contrast_unlabel_only', action='store_true', default=False)
-
     '''group-wise entropy regularization'''
     # memax weight for offline session
     parser.add_argument('--memax_weight', type=float, default=1)
